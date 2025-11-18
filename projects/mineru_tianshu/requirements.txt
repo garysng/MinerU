@@ -26,7 +26,7 @@ markitdown[all]>=0.1.3
 
 # MinIO Object Storage
 minio>=7.2.0
-
+oss2>=2.19.0
 # Optional: For better performance
 # ujson>=5.10.0
 

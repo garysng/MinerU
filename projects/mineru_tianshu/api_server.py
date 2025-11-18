@@ -16,7 +16,7 @@ from datetime import datetime
 import os
 import re
 import uuid
-from minio import Minio
+from abc import ABC, abstractmethod
 
 from task_db import TaskDB
 
@@ -43,24 +43,184 @@ db = TaskDB()
 OUTPUT_DIR = Path('/tmp/mineru_tianshu_output')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# MinIO 配置
-MINIO_CONFIG = {
-    'endpoint': os.getenv('MINIO_ENDPOINT', ''),
-    'access_key': os.getenv('MINIO_ACCESS_KEY', ''),
-    'secret_key': os.getenv('MINIO_SECRET_KEY', ''),
-    'secure': True,
-    'bucket_name': os.getenv('MINIO_BUCKET', '')
-}
+
+# ==================== 存储后端抽象层 ====================
+
+class StorageBackend(ABC):
+    """存储后端抽象基类"""
+    
+    @abstractmethod
+    def upload_file(self, local_path: str, object_name: str) -> str:
+        """
+        上传文件到对象存储
+        
+        Args:
+            local_path: 本地文件路径
+            object_name: 对象存储中的路径/键名
+            
+        Returns:
+            访问 URL
+        """
+        pass
+    
+    @abstractmethod
+    def get_url(self, object_name: str) -> str:
+        """
+        获取对象的访问 URL
+        
+        Args:
+            object_name: 对象存储中的路径/键名
+            
+        Returns:
+            访问 URL
+        """
+        pass
+    
+    @abstractmethod
+    def check_connection(self) -> bool:
+        """检查存储后端连接是否正常"""
+        pass
 
 
-def get_minio_client():
-    """获取MinIO客户端实例"""
-    return Minio(
-        MINIO_CONFIG['endpoint'],
-        access_key=MINIO_CONFIG['access_key'],
-        secret_key=MINIO_CONFIG['secret_key'],
-        secure=MINIO_CONFIG['secure']
-    )
+class MinioStorage(StorageBackend):
+    """MinIO/腾讯云 COS 存储后端（S3兼容）"""
+    
+    def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str, secure: bool = True):
+        from minio import Minio
+        self.endpoint = endpoint
+        self.bucket = bucket
+        self.secure = secure
+        self.client = Minio(
+            endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure
+        )
+    
+    def upload_file(self, local_path: str, object_name: str) -> str:
+        """上传文件到 MinIO/COS"""
+        self.client.fput_object(self.bucket, object_name, local_path)
+        return self.get_url(object_name)
+    
+    def get_url(self, object_name: str) -> str:
+        """生成访问 URL"""
+        scheme = 'https' if self.secure else 'http'
+        return f"{scheme}://{self.endpoint}/{object_name}"
+    
+    def check_connection(self) -> bool:
+        """检查连接"""
+        try:
+            return self.client.bucket_exists(self.bucket)
+        except Exception as e:
+            logger.error(f"MinIO connection check failed: {e}")
+            return False
+
+
+class OSSStorage(StorageBackend):
+    """阿里云 OSS 存储后端"""
+    
+    def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str):
+        import oss2
+        self.endpoint = endpoint
+        self.bucket_name = bucket
+        
+        # 创建认证对象
+        auth = oss2.Auth(access_key, secret_key)
+        
+        # 创建 Bucket 对象
+        self.bucket = oss2.Bucket(auth, endpoint, bucket)
+    
+    def upload_file(self, local_path: str, object_name: str) -> str:
+        """上传文件到阿里云 OSS"""
+        self.bucket.put_object_from_file(object_name, local_path)
+        return self.get_url(object_name)
+    
+    def get_url(self, object_name: str) -> str:
+        """生成访问 URL"""
+        # 阿里云 OSS 公有读 URL 格式
+        return f"https://{self.bucket_name}.{self.endpoint}/{object_name}"
+    
+    def check_connection(self) -> bool:
+        """检查连接"""
+        try:
+            # 尝试获取 bucket 信息
+            self.bucket.get_bucket_info()
+            return True
+        except Exception as e:
+            logger.error(f"OSS connection check failed: {e}")
+            return False
+
+
+def create_storage_backend() -> Optional[StorageBackend]:
+    """
+    根据环境变量创建存储后端实例
+    
+    环境变量:
+        STORAGE_TYPE: 存储类型 (minio/cos/oss)
+        
+        MinIO/COS:
+            MINIO_ENDPOINT: 端点
+            MINIO_ACCESS_KEY: Access Key
+            MINIO_SECRET_KEY: Secret Key
+            MINIO_BUCKET: Bucket 名称
+            MINIO_SECURE: 是否使用 HTTPS (true/false)
+            
+        阿里云 OSS:
+            OSS_ENDPOINT: 端点 (如 oss-cn-shanghai.aliyuncs.com)
+            OSS_ACCESS_KEY: Access Key ID
+            OSS_SECRET_KEY: Access Key Secret
+            OSS_BUCKET: Bucket 名称
+    
+    Returns:
+        StorageBackend 实例，如果配置不完整则返回 None
+    """
+    storage_type = os.getenv('STORAGE_TYPE', 'minio').lower()
+    
+    try:
+        if storage_type in ['minio', 'cos']:
+            # MinIO 或腾讯云 COS（S3 兼容）
+            endpoint = os.getenv('MINIO_ENDPOINT', '')
+            access_key = os.getenv('MINIO_ACCESS_KEY', '')
+            secret_key = os.getenv('MINIO_SECRET_KEY', '')
+            bucket = os.getenv('MINIO_BUCKET', '')
+            secure = os.getenv('MINIO_SECURE', 'true').lower() == 'true'
+            
+            if not all([endpoint, access_key, secret_key, bucket]):
+                logger.warning(f"MinIO/COS storage not configured, image upload will be disabled")
+                return None
+            
+            logger.info(f"✅ Initialized {storage_type.upper()} storage: {endpoint}/{bucket}")
+            return MinioStorage(endpoint, access_key, secret_key, bucket, secure)
+        
+        elif storage_type == 'oss':
+            # 阿里云 OSS
+            endpoint = os.getenv('OSS_ENDPOINT', '')
+            access_key = os.getenv('OSS_ACCESS_KEY', '')
+            secret_key = os.getenv('OSS_SECRET_KEY', '')
+            bucket = os.getenv('OSS_BUCKET', '')
+            
+            if not all([endpoint, access_key, secret_key, bucket]):
+                logger.warning(f"OSS storage not configured, image upload will be disabled")
+                return None
+            
+            logger.info(f"✅ Initialized OSS storage: {endpoint}/{bucket}")
+            return OSSStorage(endpoint, access_key, secret_key, bucket)
+        
+        else:
+            logger.warning(f"Unknown storage type: {storage_type}, image upload will be disabled")
+            return None
+            
+    except ImportError as e:
+        logger.error(f"Failed to import storage library: {e}")
+        logger.error(f"Please install: pip install minio (for MinIO/COS) or pip install oss2 (for OSS)")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to create storage backend: {e}")
+        return None
+
+
+# 初始化存储后端
+storage_backend = create_storage_backend()
 
 
 def process_markdown_images(md_content: str, image_dir: Path, upload_images: bool = False):
@@ -70,7 +230,7 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
     Args:
         md_content: Markdown 内容
         image_dir: 图片所在目录
-        upload_images: 是否上传图片到 MinIO 并替换链接
+        upload_images: 是否上传图片到对象存储并替换链接
         
     Returns:
         处理后的 Markdown 内容
@@ -78,11 +238,11 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
     if not upload_images:
         return md_content
     
+    if not storage_backend:
+        logger.warning("Storage backend not configured, images will not be uploaded")
+        return md_content
+    
     try:
-        minio_client = get_minio_client()
-        bucket_name = MINIO_CONFIG['bucket_name']
-        minio_endpoint = MINIO_CONFIG['endpoint']
-        
         # 查找所有 markdown 格式的图片
         img_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
         
@@ -100,18 +260,14 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
                 new_filename = f"{uuid.uuid4()}{file_extension}"
                 
                 try:
-                    # 上传到 MinIO
+                    # 上传到对象存储
                     object_name = f"images/{new_filename}"
-                    minio_client.fput_object(bucket_name, object_name, str(full_image_path))
-                    
-                    # 生成 MinIO 访问 URL
-                    scheme = 'https' if MINIO_CONFIG['secure'] else 'http'
-                    minio_url = f"{scheme}://{minio_endpoint}/{bucket_name}/{object_name}"
+                    storage_url = storage_backend.upload_file(str(full_image_path), object_name)
                     
                     # 返回 HTML 格式的 img 标签
-                    return f'<img src="{minio_url}" alt="{alt_text}">'
+                    return f'<img src="{storage_url}" alt="{alt_text}">'
                 except Exception as e:
-                    logger.error(f"Failed to upload image to MinIO: {e}")
+                    logger.error(f"Failed to upload image to storage: {e}")
                     return match.group(0)  # 上传失败，保持原样
             
             return match.group(0)
