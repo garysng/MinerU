@@ -7,6 +7,7 @@ MinerU Tianshu - API Server
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import tempfile
 from pathlib import Path
 from loguru import logger
@@ -17,6 +18,7 @@ import os
 import re
 import uuid
 from abc import ABC, abstractmethod
+from urllib.parse import urlparse, unquote
 
 from task_db import TaskDB
 
@@ -64,6 +66,20 @@ class StorageBackend(ABC):
         pass
     
     @abstractmethod
+    def download_file(self, object_name: str, local_path: str) -> int:
+        """
+        从对象存储下载文件到本地
+        
+        Args:
+            object_name: 对象存储中的路径/键名
+            local_path: 本地保存路径
+            
+        Returns:
+            下载的文件大小（字节）
+        """
+        pass
+    
+    @abstractmethod
     def get_url(self, object_name: str) -> str:
         """
         获取对象的访问 URL
@@ -102,6 +118,12 @@ class MinioStorage(StorageBackend):
         self.client.fput_object(self.bucket, object_name, local_path)
         return self.get_url(object_name)
     
+    def download_file(self, object_name: str, local_path: str) -> int:
+        """从 MinIO/COS 下载文件到本地"""
+        self.client.fget_object(self.bucket, object_name, local_path)
+        # 返回文件大小
+        return Path(local_path).stat().st_size
+    
     def get_url(self, object_name: str) -> str:
         """生成访问 URL"""
         scheme = 'https' if self.secure else 'http'
@@ -134,6 +156,12 @@ class OSSStorage(StorageBackend):
         """上传文件到阿里云 OSS"""
         self.bucket.put_object_from_file(object_name, local_path)
         return self.get_url(object_name)
+    
+    def download_file(self, object_name: str, local_path: str) -> int:
+        """从阿里云 OSS 下载文件到本地"""
+        self.bucket.get_object_to_file(object_name, local_path)
+        # 返回文件大小
+        return Path(local_path).stat().st_size
     
     def get_url(self, object_name: str) -> str:
         """生成访问 URL"""
@@ -233,20 +261,24 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
         upload_images: 是否上传图片到对象存储并替换链接
         
     Returns:
-        处理后的 Markdown 内容
+        (处理后的 Markdown 内容, 实际上传的图片数量)
     """
     if not upload_images:
-        return md_content
+        return md_content, 0
     
     if not storage_backend:
         logger.warning("Storage backend not configured, images will not be uploaded")
-        return md_content
+        return md_content, 0
     
     try:
         # 查找所有 markdown 格式的图片
         img_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
         
+        # 统计实际上传的图片数量
+        uploaded_count = 0
+        
         def replace_image(match):
+            nonlocal uploaded_count
             alt_text = match.group(1)
             image_path = match.group(2)
             
@@ -264,6 +296,9 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
                     object_name = f"images/{new_filename}"
                     storage_url = storage_backend.upload_file(str(full_image_path), object_name)
                     
+                    # 上传成功，计数加1
+                    uploaded_count += 1
+                    
                     # 返回 HTML 格式的 img 标签
                     return f'<img src="{storage_url}" alt="{alt_text}">'
                 except Exception as e:
@@ -274,11 +309,11 @@ def process_markdown_images(md_content: str, image_dir: Path, upload_images: boo
         
         # 替换所有图片引用
         new_content = re.sub(img_pattern, replace_image, md_content)
-        return new_content
+        return new_content, uploaded_count
         
     except Exception as e:
         logger.error(f"Error processing markdown images: {e}")
-        return md_content  # 出错时返回原内容
+        return md_content, 0  # 出错时返回原内容
 
 
 @app.get("/")
@@ -307,23 +342,40 @@ async def submit_task(
     
     立即返回 task_id，任务在后台异步处理
     """
+    temp_file_path = None
+    
     try:
         # 保存上传的文件到临时目录
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix)
+        temp_file_path = temp_file.name
         
         # 流式写入文件到磁盘，避免高内存使用
+        bytes_written = 0
         while True:
             chunk = await file.read(1 << 23)  # 8MB chunks
             if not chunk:
                 break
-            temp_file.write(chunk)
+            written = temp_file.write(chunk)
+            bytes_written += written
         
         temp_file.close()
+        
+        # 校验文件大小
+        if bytes_written == 0:
+            # 清理空文件
+            Path(temp_file_path).unlink(missing_ok=True)
+            logger.warning(f"⚠️  Empty file upload rejected: {file.filename}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Uploaded file '{file.filename}' is empty (0 bytes). Please check your file and try again."
+            )
+        
+        logger.info(f"📦 File uploaded: {file.filename} ({bytes_written} bytes)")
         
         # 创建任务
         task_id = db.create_task(
             file_name=file.filename,
-            file_path=temp_file.name,
+            file_path=temp_file_path,
             backend=backend,
             options={
                 'lang': lang,
@@ -334,7 +386,7 @@ async def submit_task(
             priority=priority
         )
         
-        logger.info(f"✅ Task submitted: {task_id} - {file.filename} (priority: {priority})")
+        logger.info(f"✅ Task submitted: {task_id} - {file.filename} ({bytes_written} bytes, priority: {priority})")
         
         return {
             'success': True,
@@ -342,11 +394,171 @@ async def submit_task(
             'status': 'pending',
             'message': 'Task submitted successfully',
             'file_name': file.filename,
+            'file_size': bytes_written,
+            'created_at': datetime.now().isoformat()
+        }
+    except Exception as e:
+        # 清理临时文件
+        if temp_file_path and Path(temp_file_path).exists():
+            Path(temp_file_path).unlink(missing_ok=True)
+            logger.debug(f"🧹 Cleaned up temp file: {temp_file_path}")
+        logger.error(f"❌ Failed to submit task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class OSSTaskSubmit(BaseModel):
+    """通过 OSS 提交任务的请求模型"""
+    object_name: str = Field(..., description="OSS/MinIO/COS 中的对象路径", example="documents/sample.pdf")
+    file_name: Optional[str] = Field(None, description="文件名称（可选，默认从 object_name 提取）", example="sample.pdf")
+    backend: str = Field('pipeline', description="处理后端: pipeline/vlm-transformers/vlm-vllm-engine")
+    lang: str = Field('ch', description="语言: ch/en/korean/japan等")
+    method: str = Field('auto', description="解析方法: auto/txt/ocr")
+    formula_enable: bool = Field(True, description="是否启用公式识别")
+    table_enable: bool = Field(True, description="是否启用表格识别")
+    priority: int = Field(0, description="优先级，数字越大越优先")
+
+
+@app.post("/api/v1/tasks/submit_by_oss")
+async def submit_task_by_oss(request: OSSTaskSubmit):
+    """
+    通过 OSS/MinIO/COS 对象路径提交文档解析任务
+    
+    工作流程：
+    1. 接收 OSS 对象路径（JSON body）
+    2. 从对象存储下载文件到临时目录
+    3. 验证文件大小
+    4. 创建任务并返回 task_id
+    
+    要求：
+    - 服务端必须配置存储后端（STORAGE_TYPE 环境变量）
+    - 服务端凭证需要有读取权限
+    
+    示例：
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/tasks/submit_by_oss \
+      -H "Content-Type: application/json" \
+      -d '{
+        "object_name": "documents/sample.pdf",
+        "file_name": "sample.pdf",
+        "backend": "pipeline",
+        "lang": "ch"
+      }'
+    ```
+    
+    或使用 OSS URL：
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/tasks/submit_by_oss \
+      -H "Content-Type: application/json" \
+      -d '{
+        "object_name": "https://bucket.oss-cn-beijing.aliyuncs.com/docs/file.pdf",
+        "backend": "pipeline"
+      }'
+    ```
+    """
+    temp_file_path = None
+    
+    try:
+        # 检查存储后端是否配置
+        if not storage_backend:
+            raise HTTPException(
+                status_code=503,
+                detail="Storage backend not configured. Please set STORAGE_TYPE and related environment variables."
+            )
+        
+        # 解析 object_name（支持完整 URL 或路径）
+        object_name = request.object_name
+        parsed_object_name = object_name
+        
+        # 如果是完整的 URL，提取 object key
+        if object_name.startswith(('http://', 'https://')):
+            parsed_url = urlparse(object_name)
+            # 提取路径部分，去除开头的 /
+            parsed_object_name = unquote(parsed_url.path.lstrip('/'))
+            logger.info(f"📎 Parsed URL: {object_name} → {parsed_object_name}")
+        
+        # 确定文件名
+        file_name = request.file_name
+        if not file_name:
+            # 从 object_name 提取文件名
+            file_name = Path(parsed_object_name).name
+            if not file_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot determine file name. Please provide file_name parameter."
+                )
+        
+        # 创建临时文件
+        suffix = Path(file_name).suffix or '.tmp'
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_file.close()  # 关闭文件以便 storage backend 写入
+        temp_file_path = temp_file.name
+        
+        logger.info(f"📥 Downloading from storage: {parsed_object_name}")
+        
+        # 从对象存储下载文件
+        try:
+            file_size = storage_backend.download_file(parsed_object_name, temp_file_path)
+        except Exception as e:
+            logger.error(f"❌ Failed to download from storage: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download file from storage: {str(e)}. Please check object_name and permissions."
+            )
+        
+        # 校验文件大小
+        if file_size == 0:
+            Path(temp_file_path).unlink(missing_ok=True)
+            logger.warning(f"⚠️  Empty file download rejected: {parsed_object_name}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Downloaded file '{parsed_object_name}' is empty (0 bytes). Please check the source file."
+            )
+        
+        logger.info(f"📦 File downloaded: {file_name} ({file_size} bytes)")
+        
+        # 创建任务
+        task_id = db.create_task(
+            file_name=file_name,
+            file_path=temp_file_path,
+            backend=request.backend,
+            options={
+                'lang': request.lang,
+                'method': request.method,
+                'formula_enable': request.formula_enable,
+                'table_enable': request.table_enable,
+                'source': 'oss',  # 标记来源
+                'object_name': parsed_object_name,  # 记录解析后的对象名称
+                'original_url': object_name,  # 记录原始 URL/路径
+            },
+            priority=request.priority
+        )
+        
+        logger.info(f"✅ Task submitted from OSS: {task_id} - {file_name} ({file_size} bytes, priority: {request.priority})")
+        
+        return {
+            'success': True,
+            'task_id': task_id,
+            'status': 'pending',
+            'message': 'Task submitted successfully from OSS',
+            'file_name': file_name,
+            'object_name': parsed_object_name,
+            'original_url': object_name,
+            'file_size': file_size,
+            'source': 'oss',
             'created_at': datetime.now().isoformat()
         }
     
+    except HTTPException:
+        # 重新抛出 HTTP 异常
+        if temp_file_path and Path(temp_file_path).exists():
+            Path(temp_file_path).unlink(missing_ok=True)
+        raise
     except Exception as e:
-        logger.error(f"❌ Failed to submit task: {e}")
+        # 清理临时文件
+        if temp_file_path and Path(temp_file_path).exists():
+            Path(temp_file_path).unlink(missing_ok=True)
+            logger.debug(f"🧹 Cleaned up temp file: {temp_file_path}")
+        logger.error(f"❌ Failed to submit task from OSS: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -415,13 +627,22 @@ async def get_task_status(
                     # 处理图片（如果需要）
                     if upload_images and image_dir.exists():
                         logger.info(f"🖼️  Processing images for task {task_id}, upload_images={upload_images}")
-                        md_content = process_markdown_images(md_content, image_dir, upload_images)
+                        # 统计图片目录中的文件总数
+                        image_files = list(image_dir.glob('*'))
+                        total_images = len([f for f in image_files if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.webp']])
+                        logger.info(f"📊 Found {total_images} images in directory")
+                        
+                        # 处理并上传 Markdown 中引用的图片
+                        md_content, uploaded_count = process_markdown_images(md_content, image_dir, upload_images)
+                        logger.info(f"✅ Uploaded {uploaded_count}/{total_images} images to storage (only images referenced in Markdown)")
+                    else:
+                        md_content, _ = process_markdown_images(md_content, image_dir, upload_images)
                     
                     # 添加 data 字段
                     response['data'] = {
                         'markdown_file': md_file.name,
                         'content': md_content,
-                        'images_uploaded': upload_images,
+                        'images_uploaded': upload_images,  # 保持原返回值（布尔值）
                         'has_images': image_dir.exists() if not upload_images else None
                     }
                     logger.info(f"✅ Response data field added successfully")
