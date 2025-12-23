@@ -14,6 +14,7 @@
 - OSS_ACCESS_KEY: Access Key ID
 - OSS_SECRET_KEY: Access Key Secret
 - OSS_BUCKET: Bucket 名称
+- API_BASE_URL: API 服务地址
 
 使用方法：
     # 运行完整流程

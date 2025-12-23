@@ -1,0 +1,12 @@
+{
+    "input": {
+        "object_name": "documents/sample.pdf",
+        "file_name": "sample.pdf",
+        "backend": "pipeline",
+        "lang": "ch",
+        "method": "auto",
+        "formula_enable": true,
+        "table_enable": true,
+        "priority": 0
+    }
+}
