@@ -12,6 +12,7 @@ import time
 import threading
 import signal
 import atexit
+import traceback
 from pathlib import Path
 import litserve as ls
 from loguru import logger
@@ -20,7 +21,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from task_db import TaskDB
-from mineru.cli.common import do_parse, read_fn
+from mineru.cli.common import do_parse, aio_do_parse, read_fn
 from mineru.utils.config_reader import get_device
 from mineru.utils.model_utils import get_vram, clean_memory
 
@@ -63,6 +64,8 @@ class MinerUWorkerAPI(ls.LitAPI):
         self.markitdown = None
         self.running = False  # Worker 运行状态
         self.worker_thread = None  # Worker 线程
+        # 专供 http-client 后端使用的持久事件循环，避免重复创建/关闭导致的 loop 已关闭问题
+        self.http_client_loop = None
     
     def setup(self, device):
         """
@@ -173,7 +176,15 @@ class MinerUWorkerAPI(ls.LitAPI):
                     try:
                         self._process_task(task)
                     except Exception as e:
-                        logger.error(f"❌ {self.worker_id} failed to process task {task_id}: {e}")
+                        # 打印完整堆栈，便于定位事件循环相关问题
+                        logger.exception(f"❌ {self.worker_id} failed to process task {task_id}")
+                        try:
+                            with open("/tmp/mineru_vl_exceptions.log", "a", encoding="utf-8") as f:
+                                f.write(f"[Worker {self.worker_id}] task {task_id} exception:\n")
+                                traceback.print_exc(file=f)
+                                f.write("\n")
+                        except Exception:
+                            logger.warning("Failed to write exception stack to /tmp/mineru_vl_exceptions.log")
                         success = self.db.update_task_status(
                             task_id, 'failed', 
                             error_message=str(e), 
@@ -194,7 +205,14 @@ class MinerUWorkerAPI(ls.LitAPI):
                     time.sleep(self.poll_interval)
                     
             except Exception as e:
-                logger.error(f"❌ {self.worker_id} loop error: {e}")
+                logger.exception(f"❌ {self.worker_id} loop error")
+                try:
+                    with open("/tmp/mineru_vl_exceptions.log", "a", encoding="utf-8") as f:
+                        f.write(f"[Worker {self.worker_id}] loop exception:\n")
+                        traceback.print_exc(file=f)
+                        f.write("\n")
+                except Exception:
+                    logger.warning("Failed to write loop exception stack to /tmp/mineru_vl_exceptions.log")
                 time.sleep(self.poll_interval)
         
         logger.info(f"⏹️  {self.worker_id} stopped task polling loop")
@@ -313,18 +331,40 @@ class MinerUWorkerAPI(ls.LitAPI):
         try:
             # 读取文件
             pdf_bytes = read_fn(file_path)
-            
-            # 执行解析（MinerU 的 ModelSingleton 会自动复用模型）
-            do_parse(
-                output_dir=str(output_path),
-                pdf_file_names=[Path(file_name).stem],
-                pdf_bytes_list=[pdf_bytes],
-                p_lang_list=[options.get('lang', 'ch')],
-                backend=backend,
-                parse_method=options.get('method', 'auto'),
-                formula_enable=options.get('formula_enable', True),
-                table_enable=options.get('table_enable', True),
-            )
+
+            if backend == "http-client":
+                # 为 http-client 维护持久事件循环，避免 asyncio.run 频繁创建/关闭导致 loop 已关闭
+                import asyncio
+                if self.http_client_loop is None or self.http_client_loop.is_closed():
+                    self.http_client_loop = asyncio.new_event_loop()
+                server_url = options.get("server_url") or os.getenv("MINERU_VL_SERVER")
+
+                async def _run():
+                    await aio_do_parse(
+                        output_dir=str(output_path),
+                        pdf_file_names=[Path(file_name).stem],
+                        pdf_bytes_list=[pdf_bytes],
+                        p_lang_list=[options.get('lang', 'ch')],
+                        backend=backend,
+                        parse_method=options.get('method', 'auto'),
+                        formula_enable=options.get('formula_enable', True),
+                        table_enable=options.get('table_enable', True),
+                        server_url=server_url,
+                    )
+
+                self.http_client_loop.run_until_complete(_run())
+            else:
+                # 执行同步解析（非 http-client）
+                do_parse(
+                    output_dir=str(output_path),
+                    pdf_file_names=[Path(file_name).stem],
+                    pdf_bytes_list=[pdf_bytes],
+                    p_lang_list=[options.get('lang', 'ch')],
+                    backend=backend,
+                    parse_method=options.get('method', 'auto'),
+                    formula_enable=options.get('formula_enable', True),
+                    table_enable=options.get('table_enable', True),
+                )
         finally:
             # 使用 MinerU 自带的内存清理函数
             # 这个函数只清理推理产生的中间结果，不会卸载模型
